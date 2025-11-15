@@ -1,9 +1,9 @@
 """
 Module Training và Evaluation cho Model Logistic Regression
-Sử dụng PySpark MLlib
+Sử dụng PySpark MLlib với K-fold Cross Validation Pipeline
 """
 from pyspark.sql import SparkSession, DataFrame
-from pyspark.ml.classification import LogisticRegression
+from pyspark.ml.classification import LogisticRegression, LogisticRegressionModel
 from pyspark.ml.evaluation import BinaryClassificationEvaluator, MulticlassClassificationEvaluator
 from pyspark.ml import Pipeline, PipelineModel
 from pyspark.ml.tuning import ParamGridBuilder, CrossValidator
@@ -24,6 +24,9 @@ class CardioLogisticModel:
         self.model = None
         self.pipeline_model = None
         self.feature_names = None
+        self.train_df = None
+        self.test_df = None
+        self.best_params = None
         
     def create_logistic_model(self, 
                              max_iter: int = 100,
@@ -56,13 +59,52 @@ class CardioLogisticModel:
         
         return lr
     
+    def split_data(self, df: DataFrame, train_ratio: float = 0.8, seed: int = 42):
+        """
+        BƯỚC 1: Chia dữ liệu Train/Test
+        
+        Args:
+            df: DataFrame với features và label
+            train_ratio: Tỷ lệ train (default 0.8)
+            seed: Random seed
+        """
+        logger.info("=" * 70)
+        logger.info("BƯỚC 1: CHIA DỮ LIỆU TRAIN/TEST")
+        logger.info("=" * 70)
+        
+        self.train_df, self.test_df = df.randomSplit([train_ratio, 1 - train_ratio], seed=seed)
+        
+        train_count = self.train_df.count()
+        test_count = self.test_df.count()
+        total_count = train_count + test_count
+        
+        # Kiểm tra phân bố class trong train/test
+        train_pos = self.train_df.filter("cardio = 1").count()
+        train_neg = train_count - train_pos
+        test_pos = self.test_df.filter("cardio = 1").count()
+        test_neg = test_count - test_pos
+        
+        logger.info(f"\n📊 THỐNG KÊ PHÂN CHIA:")
+        logger.info(f"  Total:     {total_count:,} samples")
+        logger.info(f"  Train:     {train_count:,} samples ({train_count/total_count*100:.1f}%)")
+        logger.info(f"  Test:      {test_count:,} samples ({test_count/total_count*100:.1f}%)")
+        logger.info(f"\n  Train - Positive: {train_pos:,} ({train_pos/train_count*100:.1f}%)")
+        logger.info(f"  Train - Negative: {train_neg:,} ({train_neg/train_count*100:.1f}%)")
+        logger.info(f"  Test  - Positive: {test_pos:,} ({test_pos/test_count*100:.1f}%)")
+        logger.info(f"  Test  - Negative: {test_neg:,} ({test_neg/test_count*100:.1f}%)")
+        
+        logger.info("\n✓ Test set được giữ nguyên - KHÔNG động đến cho đến evaluation cuối")
+        logger.info("=" * 70)
+        
+        return self.train_df, self.test_df
+    
     def train(self, 
              train_df: DataFrame,
              max_iter: int = 100,
              reg_param: float = 0.01,
-             elastic_net_param: float = 0.0) -> LogisticRegression:
+             elastic_net_param: float = 0.0) -> LogisticRegressionModel:
         """
-        Training model
+        Training model (training thủ công - không dùng CV)
         
         Args:
             train_df: Training DataFrame (phải có cột 'features' và 'cardio')
@@ -74,7 +116,7 @@ class CardioLogisticModel:
             Trained model
         """
         logger.info("=" * 60)
-        logger.info("BẮT ĐẦU TRAINING MODEL")
+        logger.info("TRAINING MODEL (Manual - không dùng CV)")
         logger.info("=" * 60)
         
         # Tạo model
@@ -89,6 +131,182 @@ class CardioLogisticModel:
         
         return self.model
     
+    def cross_validate(self, 
+                      train_df: DataFrame,
+                      param_grid: dict = None,
+                      num_folds: int = 5) -> tuple:
+        """
+        BƯỚC 2: K-fold Cross Validation trên TRAIN set để tìm best hyperparameters
+        
+        Args:
+            train_df: Training DataFrame (CHỈ train set, không bao gồm test)
+            param_grid: Dictionary với các parameters cần test
+            num_folds: Số folds cho cross validation
+            
+        Returns:
+            Tuple (best_model, best_params, avg_metrics)
+        """
+        logger.info("=" * 70)
+        logger.info(f"BƯỚC 2: K-FOLD CROSS VALIDATION ({num_folds} folds)")
+        logger.info("=" * 70)
+        logger.info("⚠️  CHÚ Ý: CV chỉ chạy trên TRAIN set, test set KHÔNG được động đến!")
+        
+        # Tạo base model
+        lr = LogisticRegression(
+            featuresCol="features",
+            labelCol="cardio",
+            family="binomial"
+        )
+        
+        # Param grid
+        if param_grid is None:
+            param_grid = {
+                'maxIter': [50, 100, 150],
+                'regParam': [0.001, 0.01, 0.1],
+                'elasticNetParam': [0.0, 0.5, 1.0]
+            }
+        
+        logger.info(f"\n🔍 Testing parameters:")
+        for key, values in param_grid.items():
+            logger.info(f"  {key}: {values}")
+        
+        # Build param grid
+        paramGridBuilder = ParamGridBuilder()
+        for param_name, param_values in param_grid.items():
+            if param_name == 'maxIter':
+                paramGridBuilder = paramGridBuilder.addGrid(lr.maxIter, param_values)
+            elif param_name == 'regParam':
+                paramGridBuilder = paramGridBuilder.addGrid(lr.regParam, param_values)
+            elif param_name == 'elasticNetParam':
+                paramGridBuilder = paramGridBuilder.addGrid(lr.elasticNetParam, param_values)
+        
+        paramGrid = paramGridBuilder.build()
+        
+        logger.info(f"  → Tổng số combinations: {len(paramGrid)}")
+        
+        # Evaluator
+        evaluator = BinaryClassificationEvaluator(
+            labelCol="cardio",
+            rawPredictionCol="rawPrediction",
+            metricName="areaUnderROC"
+        )
+        
+        # Cross Validator
+        cv = CrossValidator(
+            estimator=lr,
+            estimatorParamMaps=paramGrid,
+            evaluator=evaluator,
+            numFolds=num_folds,
+            parallelism=2,
+            seed=42
+        )
+        
+        logger.info(f"\n🚀 Running {num_folds}-fold cross validation...")
+        logger.info(f"   Training {len(paramGrid)} models × {num_folds} folds = {len(paramGrid) * num_folds} total fits")
+        
+        cv_model = cv.fit(train_df)
+        
+        # Best model
+        best_model = cv_model.bestModel
+        
+        # Best params
+        best_params = {
+            'maxIter': best_model.getMaxIter(),
+            'regParam': best_model.getRegParam(),
+            'elasticNetParam': best_model.getElasticNetParam()
+        }
+        
+        # CV results
+        avg_metrics = cv_model.avgMetrics
+        best_auc = max(avg_metrics)
+        
+        logger.info("\n✓ Cross validation hoàn thành!")
+        logger.info(f"\n📊 BEST PARAMETERS:")
+        for key, value in best_params.items():
+            logger.info(f"  {key}: {value}")
+        logger.info(f"\n📈 BEST CV AUC: {best_auc:.4f}")
+        logger.info(f"   (Trung bình trên {num_folds} folds)")
+        
+        logger.info("=" * 70)
+        
+        self.model = best_model
+        self.best_params = best_params
+        
+        return best_model, best_params, avg_metrics
+    
+    def train_with_cv_pipeline(self, 
+                               df: DataFrame,
+                               train_ratio: float = 0.8,
+                               param_grid: dict = None,
+                               num_folds: int = 5,
+                               seed: int = 42) -> dict:
+        """
+        PIPELINE ĐẦY ĐỦ: Split → K-fold CV → Evaluate
+        
+        Workflow đúng chuẩn:
+        1. Split data thành Train/Test (80/20)
+        2. K-fold CV trên TRAIN set → tìm best hyperparameters
+        3. Model tốt nhất đã được train trên full train set trong CV
+        4. Evaluate trên TEST set (unseen data)
+        
+        Args:
+            df: DataFrame đầy đủ với features và label
+            train_ratio: Tỷ lệ train/test (default 0.8)
+            param_grid: Dict hyperparameters để test
+            num_folds: Số folds cho CV (default 5)
+            seed: Random seed
+            
+        Returns:
+            Dict chứa: train_df, test_df, best_model, best_params, cv_metrics, test_metrics
+        """
+        logger.info("\n" + "=" * 70)
+        logger.info("🚀 PIPELINE TRAINING ĐẦY ĐỦ VỚI K-FOLD CROSS VALIDATION")
+        logger.info("=" * 70)
+        
+        # Bước 1: Split train/test
+        train_df, test_df = self.split_data(df, train_ratio=train_ratio, seed=seed)
+        
+        # Bước 2: K-fold CV trên TRAIN set
+        best_model, best_params, cv_results = self.cross_validate(
+            train_df=train_df,
+            param_grid=param_grid,
+            num_folds=num_folds
+        )
+        
+        # Bước 3: Evaluate trên TEST set (unseen)
+        logger.info("\n" + "=" * 70)
+        logger.info("BƯỚC 3: ĐÁNH GIÁ CUỐI CÙNG TRÊN TEST SET")
+        logger.info("=" * 70)
+        logger.info("📊 Đây là lần ĐẦU TIÊN model nhìn thấy test data!")
+        
+        test_metrics = self.evaluate(test_df)
+        
+        # Tổng kết
+        logger.info("\n" + "=" * 70)
+        logger.info("✅ HOÀN THÀNH PIPELINE")
+        logger.info("=" * 70)
+        logger.info(f"\n📋 SUMMARY:")
+        logger.info(f"  Train samples: {train_df.count():,}")
+        logger.info(f"  Test samples:  {test_df.count():,}")
+        logger.info(f"  Best CV AUC:   {max(cv_results):.4f}")
+        logger.info(f"  Test AUC:      {test_metrics['auc_roc']:.4f}")
+        logger.info(f"  Test Accuracy: {test_metrics['accuracy']:.4f}")
+        logger.info(f"  Test F1:       {test_metrics['f1_score']:.4f}")
+        logger.info("=" * 70 + "\n")
+        
+        return {
+            'train_df': train_df,
+            'test_df': test_df,
+            'best_model': best_model,
+            'best_params': best_params,
+            'cv_metrics': {
+                'best_auc': max(cv_results),
+                'all_auc_scores': cv_results,
+                'num_folds': num_folds
+            },
+            'test_metrics': test_metrics
+        }
+    
     def predict(self, df: DataFrame) -> DataFrame:
         """
         Dự đoán trên DataFrame
@@ -100,7 +318,7 @@ class CardioLogisticModel:
             DataFrame với cột prediction và probability
         """
         if self.model is None:
-            raise ValueError("Model chưa được training! Hãy gọi train() trước.")
+            raise ValueError("Model chưa được training! Hãy gọi train() hoặc train_with_cv_pipeline() trước.")
         
         logger.info("Đang dự đoán...")
         predictions = self.model.transform(df)
@@ -117,9 +335,8 @@ class CardioLogisticModel:
         Returns:
             Dictionary chứa các metrics
         """
-        logger.info("=" * 60)
-        logger.info("ĐÁNH GIÁ MODEL")
-        logger.info("=" * 60)
+        logger.info("\n📊 ĐÁNH GIÁ MODEL")
+        logger.info("-" * 70)
         
         # Dự đoán
         predictions = self.predict(test_df)
@@ -163,10 +380,9 @@ class CardioLogisticModel:
         logger.info(f"  F1-Score:  {metrics['f1_score']:.4f}")
         logger.info(f"  AUC-ROC:   {metrics['auc_roc']:.4f}")
         logger.info(f"\n  Confusion Matrix:")
-        logger.info(f"  TN={confusion_matrix['TN']}, FP={confusion_matrix['FP']}")
-        logger.info(f"  FN={confusion_matrix['FN']}, TP={confusion_matrix['TP']}")
-        
-        logger.info("=" * 60)
+        logger.info(f"    TN={confusion_matrix['TN']:,}  FP={confusion_matrix['FP']:,}")
+        logger.info(f"    FN={confusion_matrix['FN']:,}  TP={confusion_matrix['TP']:,}")
+        logger.info("-" * 70)
         
         return metrics
     
@@ -180,7 +396,6 @@ class CardioLogisticModel:
         Returns:
             Dictionary với TN, FP, FN, TP
         """
-        # Tính confusion matrix
         tp = predictions.filter((F.col("prediction") == 1) & (F.col("cardio") == 1)).count()
         tn = predictions.filter((F.col("prediction") == 0) & (F.col("cardio") == 0)).count()
         fp = predictions.filter((F.col("prediction") == 1) & (F.col("cardio") == 0)).count()
@@ -229,100 +444,6 @@ class CardioLogisticModel:
         
         return importance_df
     
-    def cross_validate(self, 
-                      train_df: DataFrame,
-                      param_grid: dict = None,
-                      num_folds: int = 3) -> tuple:
-        """
-        Cross validation để tìm best hyperparameters
-        
-        Args:
-            train_df: Training DataFrame
-            param_grid: Dictionary với các parameters cần test
-            num_folds: Số folds cho cross validation
-            
-        Returns:
-            Tuple (best_model, best_params, cv_results)
-        """
-        logger.info("=" * 60)
-        logger.info("BẮT ĐẦU CROSS VALIDATION")
-        logger.info("=" * 60)
-        
-        # Tạo base model
-        lr = LogisticRegression(
-            featuresCol="features",
-            labelCol="cardio",
-            family="binomial"
-        )
-        
-        # Param grid
-        if param_grid is None:
-            param_grid = {
-                'maxIter': [50, 100, 150],
-                'regParam': [0.001, 0.01, 0.1],
-                'elasticNetParam': [0.0, 0.5, 1.0]
-            }
-        
-        logger.info(f"Testing parameters:")
-        for key, values in param_grid.items():
-            logger.info(f"  {key}: {values}")
-        
-        # Build param grid
-        paramGrid = ParamGridBuilder()
-        for param_name, param_values in param_grid.items():
-            if param_name == 'maxIter':
-                paramGrid = paramGrid.addGrid(lr.maxIter, param_values)
-            elif param_name == 'regParam':
-                paramGrid = paramGrid.addGrid(lr.regParam, param_values)
-            elif param_name == 'elasticNetParam':
-                paramGrid = paramGrid.addGrid(lr.elasticNetParam, param_values)
-        
-        paramGrid = paramGrid.build()
-        
-        # Evaluator
-        evaluator = BinaryClassificationEvaluator(
-            labelCol="cardio",
-            rawPredictionCol="rawPrediction",
-            metricName="areaUnderROC"
-        )
-        
-        # Cross Validator
-        cv = CrossValidator(
-            estimator=lr,
-            estimatorParamMaps=paramGrid,
-            evaluator=evaluator,
-            numFolds=num_folds,
-            parallelism=2
-        )
-        
-        logger.info(f"Running {num_folds}-fold cross validation...")
-        cv_model = cv.fit(train_df)
-        
-        # Best model
-        best_model = cv_model.bestModel
-        
-        # Best params
-        best_params = {
-            'maxIter': best_model.getMaxIter(),
-            'regParam': best_model.getRegParam(),
-            'elasticNetParam': best_model.getElasticNetParam()
-        }
-        
-        logger.info("✓ Cross validation hoàn thành!")
-        logger.info(f"✓ Best parameters:")
-        for key, value in best_params.items():
-            logger.info(f"  {key}: {value}")
-        
-        # CV results
-        avg_metrics = cv_model.avgMetrics
-        logger.info(f"✓ Best AUC: {max(avg_metrics):.4f}")
-        
-        logger.info("=" * 60)
-        
-        self.model = best_model
-        
-        return best_model, best_params, avg_metrics
-    
     def save_model(self, path: str = None):
         """
         Lưu model
@@ -358,7 +479,6 @@ class CardioLogisticModel:
         
         logger.info(f"Load model từ: {path}")
         
-        from pyspark.ml.classification import LogisticRegressionModel
         self.model = LogisticRegressionModel.load(path)
         
         logger.info("✓ Đã load model")
@@ -375,7 +495,6 @@ class CardioLogisticModel:
         Returns:
             DataFrame với probability cho mỗi class
         """
-        # Extract probability for class 1 (có bệnh)
         from pyspark.ml.functions import vector_to_array
         
         predictions = predictions.withColumn(
@@ -455,13 +574,17 @@ class CardioLogisticModel:
         }
 
 
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
 def create_and_train_model(train_df: DataFrame, 
                           test_df: DataFrame,
                           max_iter: int = 100,
                           reg_param: float = 0.01,
                           save_model: bool = True) -> tuple:
     """
-    Hàm tiện ích để tạo, train và evaluate model
+    Hàm tiện ích để tạo, train và evaluate model (Manual - không dùng CV)
     
     Args:
         train_df: Training DataFrame
@@ -491,3 +614,45 @@ def create_and_train_model(train_df: DataFrame,
         cardio_model.save_model()
     
     return cardio_model, metrics
+
+
+def train_with_cv(df: DataFrame,
+                  param_grid: dict = None,
+                  num_folds: int = 5,
+                  train_ratio: float = 0.8,
+                  save_model: bool = True) -> dict:
+    """
+    Hàm tiện ích để train với K-fold CV pipeline đầy đủ
+    
+    Args:
+        df: DataFrame đầy đủ với features và label
+        param_grid: Dict hyperparameters để test
+        num_folds: Số folds cho CV
+        train_ratio: Tỷ lệ train/test
+        save_model: Lưu model hay không
+        
+    Returns:
+        Dict với đầy đủ kết quả
+    """
+    from src.utils import SparkManager
+    
+    spark = SparkManager.get_spark()
+    
+    # Tạo model
+    cardio_model = CardioLogisticModel(spark)
+    
+    # Chạy pipeline đầy đủ
+    results = cardio_model.train_with_cv_pipeline(
+        df=df,
+        train_ratio=train_ratio,
+        param_grid=param_grid,
+        num_folds=num_folds
+    )
+    
+    # Save model
+    if save_model:
+        cardio_model.save_model()
+    
+    results['model_instance'] = cardio_model
+    
+    return results
